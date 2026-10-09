@@ -12,9 +12,13 @@ from playlist_logic import (
     search_songs,
 )
 
+# Genres offered in both the "Favorite genre" and "Add a song" dropdowns.
+GENRE_OPTIONS = ["rock", "lofi", "pop", "jazz", "electronic", "ambient", "other"]
+
 
 def init_state():
     """Initialize Streamlit session state."""
+    # Session state survives reruns, so each value is only set the first time.
     if "songs" not in st.session_state:
         st.session_state.songs = default_songs()
     if "profile" not in st.session_state:
@@ -194,25 +198,25 @@ def profile_sidebar():
         value=str(profile.get("name", "")),
     )
 
-    col1, col2 = st.sidebar.columns(2)
-    with col1:
-        profile["hype_min_energy"] = st.sidebar.slider(
-            "Hype min energy",
-            min_value=1,
-            max_value=10,
-            value=int(profile.get("hype_min_energy", 7)),
-        )
-    with col2:
-        profile["chill_max_energy"] = st.sidebar.slider(
-            "Chill max energy",
-            min_value=1,
-            max_value=10,
-            value=int(profile.get("chill_max_energy", 3)),
-        )
+    # Energy cut-offs: at or above the first is Hype, at or below the second
+    # is Chill.
+    profile["hype_min_energy"] = st.sidebar.slider(
+        "Hype min energy",
+        min_value=1,
+        max_value=10,
+        value=int(profile.get("hype_min_energy", 7)),
+    )
+    profile["chill_max_energy"] = st.sidebar.slider(
+        "Chill max energy",
+        min_value=1,
+        max_value=10,
+        value=int(profile.get("chill_max_energy", 3)),
+    )
 
+    # Songs in the favorite genre always count as Hype.
     profile["favorite_genre"] = st.sidebar.selectbox(
         "Favorite genre",
-        options=["rock", "lofi", "pop", "jazz", "electronic", "ambient", "other"],
+        options=GENRE_OPTIONS,
         index=0,
     )
 
@@ -224,6 +228,22 @@ def profile_sidebar():
     st.sidebar.write("Current profile:", profile["name"])
 
 
+def song_identity(song):
+    """Return the (title, artist) pair that makes a song unique."""
+    normalized_song = normalize_song(song)
+    # Titles keep their capitalization when stored, so lowercase them here.
+    return (normalized_song["title"].lower(), normalized_song["artist"])
+
+
+def is_duplicate_song(new_song, existing_songs):
+    """Return True if new_song is already in existing_songs."""
+    new_song_identity = song_identity(new_song)
+    return any(
+        song_identity(existing_song) == new_song_identity
+        for existing_song in existing_songs
+    )
+
+
 def add_song_sidebar():
     """Render the Add Song controls in the sidebar."""
     st.sidebar.header("Add a song")
@@ -232,14 +252,15 @@ def add_song_sidebar():
     artist = st.sidebar.text_input("Artist")
     genre = st.sidebar.selectbox(
         "Genre",
-        options=["rock", "lofi", "pop", "jazz", "electronic", "ambient", "other"],
+        options=GENRE_OPTIONS,
     )
     energy = st.sidebar.slider("Energy", min_value=1, max_value=10, value=5)
     tags_text = st.sidebar.text_input("Tags (comma separated)")
 
     if st.sidebar.button("Add to playlist"):
-        raw_tags = [t.strip() for t in tags_text.split(",")]
-        tags = [t for t in raw_tags if t]
+        # Split "a, b, c" into separate tags and drop any empty ones.
+        trimmed_tags = [tag.strip() for tag in tags_text.split(",")]
+        tags = [tag for tag in trimmed_tags if tag]
 
         song: Song = {
             "title": title,
@@ -250,29 +271,26 @@ def add_song_sidebar():
         }
         # FIX: validate the normalized song, so a title or artist made only of
         # spaces is rejected instead of being saved as a blank entry.
-        normalized = normalize_song(song)
-        if not normalized["title"] or not normalized["artist"]:
+        normalized_song = normalize_song(song)
+        if not normalized_song["title"] or not normalized_song["artist"]:
             st.sidebar.warning("Enter both a title and an artist.")
             return
 
         # FIX: skip songs that are already in the list (same title and artist,
         # ignoring case and extra spaces) so totals count each song once.
-        new_song_key = (normalized["title"].lower(), normalized["artist"])
-        for existing_song in st.session_state.songs:
-            existing = normalize_song(existing_song)
-            if (existing["title"].lower(), existing["artist"]) == new_song_key:
-                st.sidebar.warning("That song is already in the playlist.")
-                return
+        if is_duplicate_song(normalized_song, st.session_state.songs):
+            st.sidebar.warning("That song is already in the playlist.")
+            return
 
-        all_songs = st.session_state.songs[:]
-        all_songs.append(normalized)
-        st.session_state.songs = all_songs
+        # Store a new list (the old songs plus the new one) in session state.
+        st.session_state.songs = st.session_state.songs + [normalized_song]
 
 
 def playlist_tabs(playlists):
     """Render playlists in tabs."""
     include_mixed = st.session_state.profile.get("include_mixed", True)
 
+    # The Mixed tab is only shown when the profile asks for it.
     tab_labels = ["Hype", "Chill"]
     if include_mixed:
         tab_labels.append("Mixed")
@@ -285,19 +303,24 @@ def playlist_tabs(playlists):
 
 
 def render_playlist(label, songs):
+    """Render one playlist: its heading, artist search box, and song list."""
     st.subheader(f"{label} playlist")
     if not songs:
         st.write("No songs in this playlist.")
         return
 
-    query = st.text_input(f"Search {label} playlist by artist", key=f"search_{label}")
-    filtered = search_songs(songs, query, field="artist")
+    # Each tab gets its own search box (the key keeps them separate).
+    search_query = st.text_input(
+        f"Search {label} playlist by artist", key=f"search_{label}"
+    )
+    matching_songs = search_songs(songs, search_query, field="artist")
 
-    if not filtered:
+    if not matching_songs:
         st.write("No matching songs.")
         return
 
-    for song in filtered:
+    # One bullet point per song.
+    for song in matching_songs:
         mood = song.get("mood", "?")
         tags = ", ".join(song.get("tags", []))
         st.write(
@@ -318,19 +341,19 @@ def lucky_section(playlists):
     )
 
     if st.button("Feeling lucky"):
-        pick = lucky_pick(playlists, mode=mode)
-        if pick is None:
+        picked_song = lucky_pick(playlists, mode=mode)
+        # None means the chosen playlist has no songs to pick from.
+        if picked_song is None:
             st.warning("No songs available for this mode.")
             return
 
         st.success(
-            f"Lucky song: {pick['title']} by {pick['artist']} "
-            f"(mood {pick.get('mood', '?')})"
+            f"Lucky song: {picked_song['title']} by {picked_song['artist']} "
+            f"(mood {picked_song.get('mood', '?')})"
         )
 
-        history = st.session_state.history
-        history.append(pick)
-        st.session_state.history = history
+        # Remember the pick so it shows up in the History section.
+        st.session_state.history.append(picked_song)
 
 
 def stats_section(playlists):
@@ -339,16 +362,18 @@ def stats_section(playlists):
 
     stats = compute_playlist_stats(playlists)
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Total songs", stats["total_songs"])
-    col2.metric("Hype songs", stats["hype_count"])
-    col3.metric("Chill songs", stats["chill_count"])
+    # First row: song counts.
+    total_column, hype_column, chill_column = st.columns(3)
+    total_column.metric("Total songs", stats["total_songs"])
+    hype_column.metric("Hype songs", stats["hype_count"])
+    chill_column.metric("Chill songs", stats["chill_count"])
 
-    col4, col5, col6 = st.columns(3)
-    col4.metric("Mixed songs", stats["mixed_count"])
+    # Second row: Mixed count and the calculated values.
+    mixed_column, ratio_column, energy_column = st.columns(3)
+    mixed_column.metric("Mixed songs", stats["mixed_count"])
     # FIX: show the hype ratio as a percentage of all songs.
-    col5.metric("Hype ratio", f"{stats['hype_ratio']:.0%}")
-    col6.metric("Average energy", f"{stats['avg_energy']:.2f}")
+    ratio_column.metric("Hype ratio", f"{stats['hype_ratio']:.0%}")
+    energy_column.metric("Average energy", f"{stats['avg_energy']:.2f}")
 
     top_artist = stats["top_artist"]
     if top_artist:
@@ -369,8 +394,9 @@ def history_section():
         st.write("No history yet.")
         return
 
-    summary = history_summary(history)
-    st.write("Recent picks by mood:", summary)
+    # How many lucky picks came from each mood.
+    picks_per_mood = history_summary(history)
+    st.write("Recent picks by mood:", picks_per_mood)
 
     show_details = st.checkbox("Show full history")
     if show_details:
@@ -398,6 +424,7 @@ def main():
         "The code runs, but the behavior is a bit unpredictable."
     )
 
+    # Sidebar: profile settings, the add-song form, and reset buttons.
     init_state()
     profile_sidebar()
     add_song_sidebar()
@@ -406,9 +433,11 @@ def main():
     profile = st.session_state.profile
     songs = st.session_state.songs
 
+    # Sort every song into its mood playlist using the current profile.
     base_playlists = build_playlists(songs, profile)
     merged_playlists = merge_playlists(base_playlists, {})
 
+    # Main page: playlists, lucky pick, stats, then pick history.
     playlist_tabs(merged_playlists)
     st.divider()
     lucky_section(merged_playlists)
